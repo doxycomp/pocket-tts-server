@@ -2,13 +2,29 @@
 
 [Chatterbox](https://github.com/resemble-ai/chatterbox) by Resemble AI provides **multilingual TTS** with **23+ languages** (e.g. German, French, Spanish, Chinese). You can use it alongside Pocket TTS and Piper.
 
+## Compatibility (Python & NumPy)
+
+The PyPI package **chatterbox-tts 0.1.6** pins **numpy<1.26**, while this project uses **numpy≥2.0**. On **Python 3.12**, building that old numpy from source also fails (`pkgutil.ImpImporter` was removed). So a plain `pip install chatterbox-tts` in the same venv as Pocket TTS often fails.
+
+**Workarounds:**
+
+- **Option A – Separate venv with Python 3.10 or 3.11 (recommended)**  
+  Create a venv with Python 3.10 or 3.11, install this project’s dependencies and then `pip install chatterbox-tts`. That way Chatterbox gets numpy<1.26 and the rest of the stack stays consistent.
+
+- **Option B – Install without Chatterbox deps (try at your own risk)**  
+  In your existing venv (with numpy≥2.0):  
+  `pip install chatterbox-tts --no-deps`  
+  Then install Chatterbox’ other dependencies by hand (e.g. `torch`, `torchaudio`, `librosa`, `transformers`, etc. from [their pyproject](https://github.com/resemble-ai/chatterbox/blob/master/pyproject.toml)). Runtime may break if Chatterbox really needs numpy<1.26.
+
+- **Option C**  
+  Watch [chatterbox-tts on PyPI](https://pypi.org/project/chatterbox-tts/) or [GitHub](https://github.com/resemble-ai/chatterbox) for a release that supports numpy 2.x and Python 3.12.
+
 ## Setup
 
-1. **Install Chatterbox (optional):**
+1. **Install Chatterbox (optional)** – see [Compatibility](#compatibility-python--numpy) above. If your environment is compatible:
    ```bash
    pip install chatterbox-tts
    ```
-   Note: Chatterbox has its own dependencies (PyTorch, etc.). If you already use Pocket TTS, you may need to ensure compatible versions.
 
 2. **Enable in config** – in `config.json` set:
    ```json
