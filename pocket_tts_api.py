@@ -58,6 +58,16 @@ try:
 except ImportError:
     PIPER_AVAILABLE = False
 
+# Try to import Chatterbox TTS (optional; 23+ languages, Resemble AI)
+try:
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+    CHATTERBOX_AVAILABLE = True
+    print("[INFO] chatterbox-tts imported successfully")
+except ImportError:
+    CHATTERBOX_AVAILABLE = False
+    ChatterboxMultilingualTTS = None
+
 
 # Load configuration
 def load_config():
@@ -73,11 +83,14 @@ def load_config():
             "voices_dir": "voices-celebrities",  # optional; pre-made/clone voices
             "voices_pockettts_dir": "voices-pockettts",  # user uploads (Pocket TTS)
             "voices_piper_dir": "voices-piper",
+            "voices_chatterbox_dir": "voices-chatterbox",  # ref WAVs for Chatterbox cloning
             "output_dir": "output",
         },
         "tts": {
             "device": "cpu",  # "cpu", "xpu" (Intel Arc), or "cuda" (Pocket TTS)
             "piper_use_cuda": False,  # Piper: use NVIDIA GPU via onnxruntime-gpu
+            "chatterbox_enabled": False,
+            "chatterbox_model": "multilingual",  # multilingual (23+ langs) only for now
         },
         "llm": {
             "enabled": False,
@@ -170,6 +183,35 @@ else:
 # Voice cache
 available_voices = {}
 piper_voices = {}  # voice_id -> PiperVoice instance (lazy-loaded)
+chatterbox_model = None  # ChatterboxMultilingualTTS, lazy-loaded when first needed
+
+
+# Chatterbox Multilingual supported language codes (from Resemble AI README)
+CHATTERBOX_LANGUAGES = [
+    "ar", "da", "de", "el", "en", "es", "fi", "fr", "he", "hi", "it", "ja", "ko",
+    "ms", "nl", "no", "pl", "pt", "ru", "sv", "sw", "tr", "zh",
+]
+
+
+def _get_chatterbox_model():
+    """Lazy-load Chatterbox Multilingual model (cuda/cpu only, no XPU)."""
+    global chatterbox_model
+    if chatterbox_model is not None:
+        return chatterbox_model
+    if not CHATTERBOX_AVAILABLE or not ChatterboxMultilingualTTS:
+        return None
+    if not config.get("tts", {}).get("chatterbox_enabled", False):
+        return None
+    try:
+        device = "cuda" if _resolve_tts_device() == "cuda" else "cpu"
+        chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+        print(f"[INFO] Chatterbox Multilingual loaded (device: {device})")
+        return chatterbox_model
+    except Exception as e:
+        print(f"[WARNING] Failed to load Chatterbox: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _get_piper_voice(voice_id):
@@ -212,6 +254,35 @@ def _piper_synthesize_to_wav_bytes(voice_id, text):
         return None
 
 
+def _chatterbox_synthesize_to_wav_bytes(voice_state, text):
+    """Synthesize text with Chatterbox Multilingual; return WAV bytes. Returns None on error."""
+    model = _get_chatterbox_model()
+    if not model:
+        return None
+    try:
+        lang = voice_state.get("language_id")
+        ref_path = voice_state.get("file")
+        kwargs = {}
+        if lang:
+            kwargs["language_id"] = lang
+        if ref_path and Path(ref_path).exists():
+            kwargs["audio_prompt_path"] = ref_path
+        wav = model.generate(text, **kwargs)
+        wav_np = wav.cpu().numpy() if hasattr(wav, "cpu") else np.asarray(wav)
+        if wav_np.ndim > 1:
+            wav_np = wav_np.squeeze()
+        sr = getattr(model, "sr", 24000)
+        buf = io.BytesIO()
+        scipy.io.wavfile.write(buf, sr, wav_np)
+        buf.seek(0)
+        return buf.read()
+    except Exception as e:
+        print(f"[WARNING] Chatterbox synthesis failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 def _synthesize_to_pcm_sync(text: str, voice_id: Optional[str]):
     """Synthesize text to raw PCM (16-bit mono). Returns (sample_rate, pcm_bytes) or None. For Wyoming."""
     if not voice_id and available_voices:
@@ -233,6 +304,14 @@ def _synthesize_to_pcm_sync(text: str, voice_id: Optional[str]):
             rate = getattr(chunks[0], "sample_rate", 22050)
             pcm = b"".join(c.audio_int16_bytes for c in chunks)
             return (rate, pcm)
+        if isinstance(voice_state, dict) and voice_state.get("engine") == "chatterbox":
+            wav_bytes = _chatterbox_synthesize_to_wav_bytes(voice_state, text)
+            if not wav_bytes:
+                return None
+            rate, arr = scipy.io.wavfile.read(io.BytesIO(wav_bytes))
+            if arr.dtype != np.int16:
+                arr = (np.clip(arr.astype(np.float64) / 32768.0, -1, 1) * 32767).astype(np.int16)
+            return (rate, arr.tobytes())
         if tts_model:
             audio = tts_model.generate_audio(voice_state, text)
             audio_np = audio.cpu().numpy() if hasattr(audio, "cpu") else audio
@@ -291,8 +370,56 @@ def _scan_pocket_voices_dir(voices_dir: Path):
     return out
 
 
+def _scan_chatterbox_voices():
+    """Scan voices-chatterbox for ref WAVs and add synthetic language voices (multilingual)."""
+    out = []
+    if not CHATTERBOX_AVAILABLE or not config.get("tts", {}).get("chatterbox_enabled", False):
+        return out
+    cb_dir = Path(config["paths"].get("voices_chatterbox_dir", "voices-chatterbox"))
+    if cb_dir.exists():
+        for wav_file in cb_dir.rglob("*.wav"):
+            if not wav_file.is_file():
+                continue
+            try:
+                rel = wav_file.relative_to(cb_dir)
+            except ValueError:
+                continue
+            path_stem = str(rel.with_suffix("")).replace("\\", "/")
+            voice_id = f"chatterbox-{path_stem.replace('/', '-').replace(' ', '-').replace('_', '-').lower()}"
+            if not voice_id.startswith("chatterbox-"):
+                voice_id = "chatterbox-" + voice_id
+            out.append({
+                "voice_id": voice_id,
+                "name": wav_file.stem,
+                "file": str(wav_file),
+                "preview": f"/voices/{voice_id}/preview",
+                "type": "custom",
+                "engine": "chatterbox",
+                "language_id": None,  # ref-based: language from ref or default
+            })
+            print(f"[INFO] Found voice (Chatterbox ref): {voice_id}")
+    # Synthetic language voices (no ref; use built-in per language)
+    ref_ids = {v["voice_id"] for v in out}
+    if config.get("tts", {}).get("chatterbox_model") == "multilingual":
+        for lang in CHATTERBOX_LANGUAGES:
+            voice_id = f"chatterbox-{lang}"
+            if voice_id in ref_ids:
+                continue
+            out.append({
+                "voice_id": voice_id,
+                "name": f"Chatterbox {lang}",
+                "file": None,
+                "preview": "",
+                "type": "chatterbox",
+                "engine": "chatterbox",
+                "language_id": lang,
+            })
+            print(f"[INFO] Found voice (Chatterbox): {voice_id}")
+    return out
+
+
 def scan_voices():
-    """Scan voice files: optional voices-celebrities, voices-pockettts (uploads), and Piper."""
+    """Scan voice files: optional voices-celebrities, voices-pockettts (uploads), Piper, and Chatterbox."""
     voices = []
     # Optional: pre-made / celebrity voices
     voices_celebrities = Path(config["paths"].get("voices_dir", "voices-celebrities"))
@@ -327,6 +454,9 @@ def scan_voices():
                 )
                 print(f"[INFO] Found voice (Piper): {voice_id}")
 
+    # Chatterbox (optional): ref WAVs + synthetic language voices
+    voices.extend(_scan_chatterbox_voices())
+
     return voices
 
 
@@ -341,6 +471,17 @@ def get_voice_state(voice_id):
     # Piper voices: return lightweight pseudo-state
     if available_voices[voice_id].get("engine") == "piper":
         voice_states[voice_id] = {"engine": "piper", "voice_id": voice_id}
+        return voice_states[voice_id]
+
+    # Chatterbox voices: state is just metadata (file + language_id)
+    if available_voices[voice_id].get("engine") == "chatterbox":
+        info = available_voices[voice_id]
+        voice_states[voice_id] = {
+            "engine": "chatterbox",
+            "voice_id": voice_id,
+            "file": info.get("file"),
+            "language_id": info.get("language_id"),
+        }
         return voice_states[voice_id]
 
     # Pocket voices: load from audio file
@@ -532,7 +673,7 @@ async def _wyoming_handle_client(reader: asyncio.StreamReader, writer: asyncio.S
             if msg_type == "describe":
                 print("[INFO] Wyoming: describe received")
                 # Wyoming/HA expect TtsProgram with "voices". Per-voice languages so HA shows only matching voices (e.g. German -> Piper de_DE).
-                def _wyoming_voice_languages(voice_id: str, engine: str) -> list:
+                def _wyoming_voice_languages(voice_id: str, engine: str, vinfo: dict) -> list:
                     if engine == "pocket":
                         return ["en"]  # Pocket TTS is English-only
                     if engine == "piper":
@@ -543,16 +684,25 @@ async def _wyoming_handle_client(reader: asyncio.StreamReader, writer: asyncio.S
                         if v.startswith("en_") or "_en_" in v or v.startswith("en"):
                             out.append("en")
                         return out if out else ["en", "de"]
+                    if engine == "chatterbox":
+                        lang = vinfo.get("language_id")
+                        if lang:
+                            return [lang]
+                        if voice_id.startswith("chatterbox-"):
+                            l = voice_id.split("-", 1)[-1]
+                            if l in CHATTERBOX_LANGUAGES:
+                                return [l]
+                        return ["en", "de"]
                     return ["en", "de"]
 
                 voices = []
                 for vid, vinfo in available_voices.items():
-                    if vinfo.get("engine") in ("pocket", "piper"):
+                    if vinfo.get("engine") in ("pocket", "piper", "chatterbox"):
                         voices.append({
                             "name": vid,
                             "attribution": {"name": "Pocket TTS Server", "url": "https://github.com/ai-joe-git/pocket-tts-server"},
                             "installed": True,
-                            "languages": _wyoming_voice_languages(vid, vinfo.get("engine", "pocket")),
+                            "languages": _wyoming_voice_languages(vid, vinfo.get("engine", "pocket"), vinfo),
                             "description": vinfo.get("name", vid),
                         })
                 if not voices:
@@ -693,10 +843,15 @@ async def create_speech(request: OpenAITTSRequest):
     """
     OpenAI-compatible TTS endpoint (Pocket TTS and Piper voices)
     """
-    if not tts_model and not PIPER_AVAILABLE:
+    tts_available = (
+        tts_model is not None
+        or PIPER_AVAILABLE
+        or (CHATTERBOX_AVAILABLE and config.get("tts", {}).get("chatterbox_enabled"))
+    )
+    if not tts_available:
         raise HTTPException(
             status_code=503,
-            detail="TTS service not available. Install pocket_tts and/or piper-tts.",
+            detail="TTS service not available. Install pocket_tts, piper-tts, and/or chatterbox-tts.",
         )
 
     try:
@@ -717,6 +872,12 @@ async def create_speech(request: OpenAITTSRequest):
             if not audio_data:
                 raise HTTPException(
                     status_code=500, detail="Piper TTS generation failed"
+                )
+        elif isinstance(voice_state, dict) and voice_state.get("engine") == "chatterbox":
+            audio_data = _chatterbox_synthesize_to_wav_bytes(voice_state, request.input)
+            if not audio_data:
+                raise HTTPException(
+                    status_code=500, detail="Chatterbox TTS generation failed"
                 )
         else:
             # Pocket path
@@ -994,13 +1155,20 @@ def split_into_sentences(text):
 
 
 def generate_sentence_audio_sync(voice_state, sentence):
-    """Generate audio for a single sentence (synchronous). Supports Pocket and Piper."""
+    """Generate audio for a single sentence (synchronous). Supports Pocket, Piper, and Chatterbox."""
     try:
         # Piper path
         if isinstance(voice_state, dict) and voice_state.get("engine") == "piper":
             audio_bytes = _piper_synthesize_to_wav_bytes(
                 voice_state["voice_id"], sentence
             )
+            if audio_bytes:
+                return base64.b64encode(audio_bytes).decode()
+            return None
+
+        # Chatterbox path
+        if isinstance(voice_state, dict) and voice_state.get("engine") == "chatterbox":
+            audio_bytes = _chatterbox_synthesize_to_wav_bytes(voice_state, sentence)
             if audio_bytes:
                 return base64.b64encode(audio_bytes).decode()
             return None
@@ -1156,6 +1324,10 @@ async def chat_completions(request: VoiceChatRequest):
                     audio_bytes = _piper_synthesize_to_wav_bytes(
                         voice_state["voice_id"], response_text
                     )
+                    if audio_bytes:
+                        audio_data = base64.b64encode(audio_bytes).decode()
+                elif isinstance(voice_state, dict) and voice_state.get("engine") == "chatterbox":
+                    audio_bytes = _chatterbox_synthesize_to_wav_bytes(voice_state, response_text)
                     if audio_bytes:
                         audio_data = base64.b64encode(audio_bytes).decode()
                 else:
