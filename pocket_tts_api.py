@@ -6,6 +6,7 @@ Provides TTS endpoints and voice chat functionality with LLM integration
 
 import asyncio
 import base64
+import importlib.util
 import io
 import json
 import os
@@ -35,16 +36,10 @@ except ImportError:
     PYDUB_AVAILABLE = False
     print("[WARNING] pydub not installed. Install with: pip install pydub")
 
-# Try to import pocket_tts
-try:
-    from pocket_tts import TTSModel
-
-    POCKET_TTS_AVAILABLE = True
-    print("[INFO] pocket_tts imported successfully")
-except ImportError as e:
-    POCKET_TTS_AVAILABLE = False
-    print(f"[WARNING] pocket_tts not installed: {e}")
-    print("[INFO] Run: pip install pocket-tts")
+# pocket_tts is imported lazily — importing it pulls in torch and can reserve GPU/XPU memory
+# even when pocket_tts_model_enabled is false. See _import_pocket_tts_package().
+POCKET_TTS_INSTALLED = importlib.util.find_spec("pocket_tts") is not None
+TTSModel = None  # set by _import_pocket_tts_package() when needed
 
 # Try to import Piper TTS (optional; for Piper voice models)
 try:
@@ -158,34 +153,56 @@ def _resolve_tts_device():
     return device if device in ("cpu", "cuda", "xpu") else "cpu"
 
 
+def _import_pocket_tts_package() -> bool:
+    """Import pocket_tts (heavy: often initializes torch / CUDA / XPU). Only when needed."""
+    global TTSModel
+    if TTSModel is not None:
+        return True
+    if not POCKET_TTS_INSTALLED:
+        return False
+    try:
+        from pocket_tts import TTSModel as _TTSModel
+
+        TTSModel = _TTSModel
+        print("[INFO] pocket_tts package imported")
+        return True
+    except ImportError as e:
+        print(f"[WARNING] pocket_tts import failed: {e}")
+        print("[INFO] Run: pip install pocket-tts")
+        return False
+
+
 _pocket_model_wanted = config.get("tts", {}).get("pocket_tts_model_enabled", True)
 
-if POCKET_TTS_AVAILABLE and _pocket_model_wanted:
-    try:
-        tts_device = _resolve_tts_device()
-        print(f"[INFO] Loading TTS model (device: {tts_device})...")
+if _pocket_model_wanted:
+    if _import_pocket_tts_package():
         try:
-            tts_model = TTSModel.load_model(device=tts_device)
-        except TypeError:
-            tts_model = TTSModel.load_model()
-            if hasattr(tts_model, "to"):
-                tts_model = tts_model.to(tts_device)
-        print(
-            f"[INFO] TTS model loaded successfully (sample rate: {tts_model.sample_rate}Hz, device: {tts_device})"
-        )
-    except Exception as e:
-        print(f"[WARNING] Failed to load TTS model: {e}")
-        import traceback
+            tts_device = _resolve_tts_device()
+            print(f"[INFO] Loading TTS model (device: {tts_device})...")
+            try:
+                tts_model = TTSModel.load_model(device=tts_device)
+            except TypeError:
+                tts_model = TTSModel.load_model()
+                if hasattr(tts_model, "to"):
+                    tts_model = tts_model.to(tts_device)
+            print(
+                f"[INFO] TTS model loaded successfully (sample rate: {tts_model.sample_rate}Hz, device: {tts_device})"
+            )
+        except Exception as e:
+            print(f"[WARNING] Failed to load TTS model: {e}")
+            import traceback
 
-        traceback.print_exc()
-        tts_model = None
-elif POCKET_TTS_AVAILABLE and not _pocket_model_wanted:
+            traceback.print_exc()
+            tts_model = None
+    else:
+        print("[WARNING] pocket_tts not installed; Pocket voices unavailable.")
+elif POCKET_TTS_INSTALLED:
     print(
-        "[INFO] Pocket TTS model not loaded (tts.pocket_tts_model_enabled is false). "
-        "Use Edge TTS and/or Piper only."
+        "[INFO] Pocket TTS package not imported (tts.pocket_tts_model_enabled is false). "
+        "Edge TTS / Piper avoid loading torch via pocket_tts."
     )
 else:
-    print("[INFO] TTS not available - voice generation disabled")
+    print("[INFO] pocket_tts not installed; use Edge TTS and/or Piper if configured.")
 
 
 def _tts_any_backend_available() -> bool:

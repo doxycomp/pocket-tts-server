@@ -44,6 +44,7 @@ If you only use **Edge TTS** (and optionally **Piper**), you can avoid loading t
 - **Pocket** clone voices will not work until you set `pocket_tts_model_enabled` back to `true` and restart.
 - **Edge** and **Piper** are unchanged.
 - `GET /health` reports `pocket_tts_model_loaded` separately from `tts_available` (any backend).
+- With `pocket_tts_model_enabled: false`, the **`pocket_tts` Python package is not imported** at startup, so **torch / XPU / CUDA are not pulled in** for Pocket TTS (that was the main source of “VRAM used anyway”).
 
 ## Voices
 
