@@ -45,6 +45,7 @@ If you only use **Edge TTS** (and optionally **Piper**), you can avoid loading t
 - **Edge** and **Piper** are unchanged.
 - `GET /health` reports `pocket_tts_model_loaded` separately from `tts_available` (any backend).
 - With `pocket_tts_model_enabled: false`, the **`pocket_tts` Python package is not imported** at startup, so **torch / XPU / CUDA are not pulled in** for Pocket TTS (that was the main source of “VRAM used anyway”).
+- The **`piper` package is also imported only when a Piper voice is actually used** (not at server startup), so **onnxruntime** does not touch the GPU until then — relevant if you had Piper installed but only use Edge voices.
 
 ## Voices
 

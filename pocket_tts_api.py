@@ -41,14 +41,12 @@ except ImportError:
 POCKET_TTS_INSTALLED = importlib.util.find_spec("pocket_tts") is not None
 TTSModel = None  # set by _import_pocket_tts_package() when needed
 
-# Try to import Piper TTS (optional; for Piper voice models)
-try:
-    from piper import PiperVoice
-
-    PIPER_AVAILABLE = True
-    print("[INFO] piper-tts imported successfully")
-except ImportError:
-    PIPER_AVAILABLE = False
+# Piper is imported lazily — `import piper` pulls in onnxruntime and may allocate GPU
+# (CUDA/DirectML) even before any voice is loaded. See _import_piper_package().
+PIPER_PACKAGE_INSTALLED = importlib.util.find_spec("piper") is not None
+PiperVoice = None  # class from piper, set by _import_piper_package()
+_piper_import_attempted = False
+_piper_import_ok = False
 
 # Try to import Edge TTS (optional; free Microsoft TTS via browser API)
 try:
@@ -205,11 +203,31 @@ else:
     print("[INFO] pocket_tts not installed; use Edge TTS and/or Piper if configured.")
 
 
+def _import_piper_package() -> bool:
+    """Import piper (may init onnxruntime / GPU). Only call when a Piper voice is used."""
+    global PiperVoice, _piper_import_attempted, _piper_import_ok
+    if _piper_import_attempted:
+        return _piper_import_ok
+    _piper_import_attempted = True
+    if not PIPER_PACKAGE_INSTALLED:
+        return False
+    try:
+        from piper import PiperVoice as _PiperVoice
+
+        PiperVoice = _PiperVoice
+        _piper_import_ok = True
+        print("[INFO] piper package imported (on demand)")
+        return True
+    except ImportError as e:
+        print(f"[WARNING] piper import failed: {e}")
+        return False
+
+
 def _tts_any_backend_available() -> bool:
     """True if at least one synthesis path can run (Pocket model, Piper, or Edge TTS)."""
     return (
         tts_model is not None
-        or PIPER_AVAILABLE
+        or PIPER_PACKAGE_INSTALLED
         or (EDGE_TTS_AVAILABLE and config.get("tts", {}).get("edge_tts_enabled"))
     )
 
@@ -223,7 +241,7 @@ def _get_piper_voice(voice_id):
     """Load and cache Piper voice by voice_id."""
     if voice_id in piper_voices:
         return piper_voices[voice_id]
-    if not PIPER_AVAILABLE or voice_id not in available_voices:
+    if not _import_piper_package() or voice_id not in available_voices:
         return None
     info = available_voices[voice_id]
     if info.get("engine") != "piper":
@@ -385,7 +403,7 @@ def scan_voices():
     voices.extend(_scan_pocket_voices_dir(voices_pockettts))
 
     # Scan Piper voices (optional); support .onnx in root and in subdirs (e.g. voices-piper/vits-piper-de_DE-thorsten-high/)
-    if PIPER_AVAILABLE:
+    if PIPER_PACKAGE_INSTALLED:
         piper_dir = Path(config["paths"].get("voices_piper_dir", "voices-piper"))
         if piper_dir.exists():
             for onnx_file in piper_dir.rglob("*.onnx"):
