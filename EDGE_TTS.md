@@ -28,6 +28,23 @@ In **`config.json`**:
 
 Restart the server. On startup, all available Edge voices are fetched and appear in the voice list (e.g. `de-DE-KatjaNeural`, `en-US-AriaNeural`).
 
+## Skip the Pocket TTS model (faster startup, less RAM/VRAM)
+
+If you only use **Edge TTS** (and optionally **Piper**), you can avoid loading the large **Pocket TTS** neural model at startup:
+
+```json
+{
+  "tts": {
+    "edge_tts_enabled": true,
+    "pocket_tts_model_enabled": false
+  }
+}
+```
+
+- **Pocket** clone voices will not work until you set `pocket_tts_model_enabled` back to `true` and restart.
+- **Edge** and **Piper** are unchanged.
+- `GET /health` reports `pocket_tts_model_loaded` separately from `tts_available` (any backend).
+
 ## Voices
 
 - **Voice ID** matches the Microsoft ShortName, e.g. `de-DE-KatjaNeural`, `en-US-GuyNeural`.

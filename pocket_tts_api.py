@@ -86,6 +86,8 @@ def load_config():
             "device": "cpu",  # "cpu", "xpu" (Intel Arc), or "cuda" (Pocket TTS)
             "piper_use_cuda": False,  # Piper: use NVIDIA GPU via onnxruntime-gpu
             "edge_tts_enabled": False,  # Microsoft Edge TTS (free, 70+ languages)
+            # If false, skip loading the heavy Pocket TTS neural model at startup (Edge/Piper only).
+            "pocket_tts_model_enabled": True,
         },
         "llm": {
             "enabled": False,
@@ -156,7 +158,9 @@ def _resolve_tts_device():
     return device if device in ("cpu", "cuda", "xpu") else "cpu"
 
 
-if POCKET_TTS_AVAILABLE:
+_pocket_model_wanted = config.get("tts", {}).get("pocket_tts_model_enabled", True)
+
+if POCKET_TTS_AVAILABLE and _pocket_model_wanted:
     try:
         tts_device = _resolve_tts_device()
         print(f"[INFO] Loading TTS model (device: {tts_device})...")
@@ -175,8 +179,23 @@ if POCKET_TTS_AVAILABLE:
 
         traceback.print_exc()
         tts_model = None
+elif POCKET_TTS_AVAILABLE and not _pocket_model_wanted:
+    print(
+        "[INFO] Pocket TTS model not loaded (tts.pocket_tts_model_enabled is false). "
+        "Use Edge TTS and/or Piper only."
+    )
 else:
     print("[INFO] TTS not available - voice generation disabled")
+
+
+def _tts_any_backend_available() -> bool:
+    """True if at least one synthesis path can run (Pocket model, Piper, or Edge TTS)."""
+    return (
+        tts_model is not None
+        or PIPER_AVAILABLE
+        or (EDGE_TTS_AVAILABLE and config.get("tts", {}).get("edge_tts_enabled"))
+    )
+
 
 # Voice cache
 available_voices = {}
@@ -817,12 +836,7 @@ async def create_speech(request: OpenAITTSRequest):
     """
     OpenAI-compatible TTS endpoint (Pocket TTS and Piper voices)
     """
-    tts_available = (
-        tts_model is not None
-        or PIPER_AVAILABLE
-        or (EDGE_TTS_AVAILABLE and config.get("tts", {}).get("edge_tts_enabled"))
-    )
-    if not tts_available:
+    if not _tts_any_backend_available():
         raise HTTPException(
             status_code=503,
             detail="TTS service not available. Install pocket_tts, piper-tts, and/or edge-tts.",
@@ -1389,7 +1403,8 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "tts_available": tts_model is not None,
+        "tts_available": _tts_any_backend_available(),
+        "pocket_tts_model_loaded": tts_model is not None,
         "voices_loaded": len(available_voices),
         "timestamp": datetime.now().isoformat(),
     }
@@ -1538,7 +1553,8 @@ if __name__ == "__main__":
 ║    GET  /v1/audio/voices        - List Voices               ║
 ║    POST /v1/chat/completions    - Voice Chat with LLM       ║{wyoming_line}
 ╠══════════════════════════════════════════════════════════════╣
-║  TTS Available: {"Yes" if tts_model else "No - Install: pip install pocket-tts":<42}║
+║  TTS backends:  {"OK (Edge/Piper/Pocket)" if _tts_any_backend_available() else "None":<42}║
+║  Pocket model:  {"loaded" if tts_model else "not loaded":<42}║
 ║  Voices Loaded: {len(available_voices):<42}║
 ╚══════════════════════════════════════════════════════════════╝
     """)
